@@ -1,0 +1,19 @@
+# v1 pattern taxonomy → RS2
+
+Restspace v1 imposed API patterns (store, transform, view, operation, store-transform, …) so a wide range of services looked identical to clients — polymorphic handling. RS2 keeps the aim with a smaller vocabulary, declared per mount on the discovery surface as `pattern` + `facets`, and expressed structurally in the generated OpenAPI (store mounts `$ref` one shared path-item shape).
+
+| v1 pattern | RS2 |
+| --- | --- |
+| `store` | `pattern: "store"` — `file` and `data`, one normative contract (see `services.md`), enforced by a conformance suite. Differences are declared `facets` (`range`, `patch`, `schema`, `echo`), not shape forks |
+| `directory` (fixed children) | Folded into store listings: fixed children (e.g. `.schema.json`) appear as entries alongside dynamic ones |
+| `transform` | `pattern: "transform"` — a `pipeline` mount (POST data → transformed data); JSONata replaced the transform DSL |
+| `view` | A GET-served pipeline mount, or the discovery documents themselves |
+| `operation` | A pipeline or custom service ending in keyed effects; declare honest effect classes |
+| `store-transform` / `store-view` / `store-operation` | Both shapes live again, with the **reserved dot-subtree** replacing v1's `X-Restspace-Request-Mode: manage` header: authoring is a store contract under `/<mount>/.pipelines/` or `/<mount>/.queries/` (guard authoring with `write`); every other path on **any verb** executes the longest-prefix-matched spec (`.root` governs the mount root). Non-modal — a URL names exactly one resource, so OpenAPI, caches, and logs stay truthful — and the authoring subtree maps 1:1 to files for git extraction |
+| `store-directory` (chords) | Config-time template expansion; no runtime mechanism |
+| static-site service | Not a separate service: config on a `file` mount (`defaultResource`, `spaFallback`, `listings: false`) + universal `caching`; declares the `static-site` facet (see `services.md`) |
+| logReader / logCollector services | `log` reader service (`view` pattern) over a node `LogStore` adapter (PRD §14); logs are OTel LogRecords, written by the host at every service boundary + on errors, and by services/sandbox code via their bound logger / `console.log`. Default local-file sink, swappable for OTLP/observability exporters. v1's logCollector ingest + external forwarding are documented follow-ons |
+| proxy service + proxy adapters (`SimpleProxyAdapter`, `AWS4ProxyAdapter`, …) | `proxy` service (`api` pattern): forward to a fixed `target` with credentials attached **host-side** via `inject` — the v1 `IProxyAdapter.buildMessage` auth step, but the secret stays out of tenant config (operator `infra:` or granted `secret:`). Built-in strategies cover the common v1 adapters: `bearer`/`header` (SimpleProxy), `awsSigV4` (AWS4), `hmac`, `basic`, `query`. See `services.md` → `proxy` |
+| swappable provider adapters (`ISmsAdapter`/`IEmailAdapter`/… — Twilio, SendGrid, SNS) | A **typed provider capability** per domain (one trait, many providers, picked by `store.adapter`), the `IQueryAdapter` model generalized. `sms` ships as the reference (`SmsGateway`): the `sms` service speaks the canonical `send`/`status` surface, a `code:` adapter maps it to the provider. Email/signing/etc. follow the same shape; swapping providers is a config change, no recompile. See `services.md` → `sms` |
+
+Pattern answers "what shape is the conversation" (client polymorphism); effect class answers "may this be retried" (safe automation). They are orthogonal — read both from the agent surface. Custom services should declare a pattern in their manifest and honor it; store-shaped custom services can be held to the store conformance contract.
