@@ -30,7 +30,8 @@ The admin commands (`login`, `send`, `service add`, `deploy`, `run`) read their 
 {
   "host": "https://api.acme.com",
   "login": { "email": "admin@acme.com" },
-  "auth": { "token": "<jwt>", "exp": 1799999999, "host": "https://api.acme.com" }
+  "auth": { "token": "<jwt>", "exp": 1799999999, "host": "https://api.acme.com" },
+  "caFile": "corp-root.pem"
 }
 ```
 
@@ -40,7 +41,33 @@ The admin commands (`login`, `send`, `service add`, `deploy`, `run`) read their 
 
 A typical flow: `rs2 login` once (writes the token), then `send` / `service add` / `deploy` / `run` reuse it until it expires.
 
+- `caFile` — optional PEM bundle of extra certificate authorities to trust when reaching `host` (see TLS below). A relative path resolves against the `rsconfig.json` that holds it.
+
 **Gitignore `rsconfig.json`.** It holds a live bearer token, and often the password it was minted from — it is CLI state, not project config.
+
+## TLS, private CAs, and proxies
+
+The CLI trusts the **union** of the machine's OS trust store and a bundled copy of the Mozilla root list. A private CA — corporate proxy, CI TLS-inspection appliance, internal PKI — normally just needs installing in the OS store. Both sources are kept because some environments have no OS trust store (a scratch container without `ca-certificates`) and Windows populates its store lazily; using either alone would break hosts that work today.
+
+When installing the CA system-wide isn't possible, name a PEM bundle — `--ca-file` is global, so it works on any verb:
+
+```bash
+rs2 --ca-file /etc/ssl/corp-root.pem send /files/report.pdf --file report.pdf
+```
+
+| Setting | Where | Effect |
+| --- | --- | --- |
+| `--ca-file <pem>` | flag, any verb | **Adds** the bundle's authorities to the roots |
+| `RS2_CA_FILE` | environment | Same, for a shell session or CI job |
+| `"caFile"` | `rsconfig.json` | Same, carried with the repo's server identity |
+| `SSL_CERT_FILE` / `SSL_CERT_DIR` | environment | Conventional OpenSSL meaning — they **replace** the OS trust store rather than adding to it |
+| `RS2_CA_ROOTS` | environment | `native` = OS store only (so a root distrusted there stays distrusted); `webpki` = bundled roots only. Default uses both |
+
+A rejected certificate reports which roots were loaded and how to add one, rather than a bare `UnknownIssuer`.
+
+**Proxies.** An explicit forward proxy is read from `ALL_PROXY`, `HTTPS_PROXY`, or `HTTP_PROXY` (either case); `NO_PROXY` is honoured as a comma-separated list of hosts and domain suffixes, or `*`. Loopback is never proxied, so a global proxy setting doesn't cut off `rs2 dev` on localhost. Transparent interception needs no proxy config — only the CA above.
+
+The same trust roots apply server-side to `httpOut` capability grants and to JS `RS2Socket` TLS connections, so a service calling an internal host behind a private CA works once that CA is in the node's OS trust store. The server does **not** read proxy environment variables.
 
 ## The instruction-plane mirror (`pull` / `push`)
 
@@ -159,10 +186,12 @@ Server feature builds matter: the standard server wires the outbound HTTP adapte
 
 ```bash
 # native+wasm build; add --js for the V8 build, --apache <domain> to wire the proxy
-curl -fsSL https://github.com/atelyr/rs2-runtime/releases/latest/download/install.sh \
+curl -fsSL https://github.com/restspace/rs2-runtime/releases/latest/download/install.sh \
   | sudo bash -s -- --js --apache api.example.com
 sudo certbot --apache -d api.example.com   # issue the cert (interactive)
 ```
+
+A release ships **server binaries only** — there is no prebuilt `rs2` CLI to download. Build it from the workspace: `cargo build --release -p rs2-cli`, binary at `target/release/rs2`.
 
 The installer runs the node as a dedicated `rs2` system user with config under `/etc/rs2`, data under `/var/lib/rs2`, and logs under `/var/log/rs2`; it never overwrites an existing config on re-install (re-running just upgrades the binary). Two release variants exist — `rs2-server` (wasm) and `rs2-server-js` (adds V8) — picked with `--js`. **The Apache vhost must set `ProxyPreserveHost On`**: RS2 resolves tenancy from the `Host` header, so a proxy that rewrites Host sends every request to the wrong tenant. WebSockets are out of scope, so no ws-tunnel module is needed. Details and manual steps: `deploy/README.md` in the runtime repo.
 
