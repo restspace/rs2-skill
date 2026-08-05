@@ -112,6 +112,7 @@ All failures are `application/problem+json`:
 | `capability_denied` | 403 | sandboxed code used an ungranted capability; extra `capability` field |
 | `not_found` | 404 | |
 | `conflict` | 409 | config version mismatch (`If-Match`), in-flight idempotent duplicate |
+| `precondition_failed` | 412 | store `If-Match`/`If-None-Match: *` not met on a write or child delete — re-read and retry |
 | `payload_too_large` | 413 | |
 | `validation_failed` | 422 | extra `errors` array of `{path, error}` |
 | `idempotency_key_reuse` | 422 | same key, different payload |

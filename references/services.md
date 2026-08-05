@@ -26,10 +26,10 @@ Every mount declares a `pattern` on the discovery surface (`store`, `store-view`
 | `PUT <child>` | Upsert: 201 created / 200 overwritten, empty body, `ETag`. Send `If-Match: <etag>` for optimistic concurrency (mismatch → **412**), or `If-None-Match: *` for create-only (exists → **412**) |
 | `POST <container>/` | Keyless create under a server-generated name → 201 + `Location` |
 | `POST <child>` | Upsert and return the stored representation (stores with the `echo` facet) |
-| `DELETE <child>` | 204 |
-| `DELETE <container>/` | 204 if empty/unguarded; non-empty → **409**; retry with `?confirm=<container name>` → 204 |
+| `DELETE <child>` | 204. Honours `If-Match` like PUT (mismatch → **412**, delete refused); a missing child is a plain 404 regardless of the header |
+| `DELETE <container>/` | 204 if empty/unguarded; non-empty → **409**; retry with `?confirm=<container name>` → 204. Conditional headers are refused with **400** (containers have no ETag to check) |
 
-The generic client loop: walk containers by trailing-slash GETs, recurse on `dir: true`, read/write children, and on a 409 container delete retry with `?confirm=`. Real differences are **facets** declared next to the pattern (`/.well-known/rs2/services` → `{"pattern": "store", "facets": [...]}`) — feature-detect, never special-case the service name. Every store declares the `conditional-write` facet: it honours `If-Match`/`If-None-Match: *` on writes (server-side, so it's race-free where the adapter has atomic compare-and-swap and best-effort otherwise — the client behaviour, send the header and handle 412, is identical either way). The generated OpenAPI expresses this structurally: all store paths `$ref` the same `#/components/pathItems/StoreContainer|StoreChild` shapes.
+The generic client loop: walk containers by trailing-slash GETs, recurse on `dir: true`, read/write children, and on a 409 container delete retry with `?confirm=`. Real differences are **facets** declared next to the pattern (`/.well-known/rs2/services` → `{"pattern": "store", "facets": [...]}`) — feature-detect, never special-case the service name. Every store declares the `conditional-write` facet: it honours `If-Match`/`If-None-Match: *` on writes and child deletes (server-side, so it's race-free where the adapter has atomic compare-and-swap and best-effort otherwise — the client behaviour, send the header and handle 412, is identical either way). The generated OpenAPI expresses this structurally: all store paths `$ref` the same `#/components/pathItems/StoreContainer|StoreChild` shapes.
 
 ## file — streamed file storage (`store`; facets: `range`, `confirm-delete`, `move`, `meta-sort`, + `static-site` when configured)
 
