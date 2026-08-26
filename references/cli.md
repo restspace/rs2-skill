@@ -11,6 +11,7 @@ The `rs2` CLI covers both the **developer loop** (scaffold, run, validate, deplo
 | `rs2 test [projectDir] [--component <path>]` | Validate `manifest.json` (name/engine/effect classes/capabilities) and the built component (wasm header; engine compile check when built with `--features wasm`) |
 | `rs2 deploy <file> --name <n> [--server <url>] [--token <t>] [--bundle]` | Keyless upload to `POST <server>/code/<n>/` (the content-addressed store derives the version; a `PUT` needs an explicit `<name>/<version>`). `.js`/`.mjs` deploys as a JS bundle; `\0asm` files as components. `--bundle` first runs `npx esbuild <file> --bundle --format=esm --platform=browser` (npm deps resolve at build time; native addons fail there). Both `--server` and `--token` default from `rsconfig.json` — `host` + `/services` (else `http://127.0.0.1:3100/services`), and the unexpired token `rs2 login` saved for that host |
 | `rs2 migrate <services.json> [-o tenant.json]` | Convert a v1 Restspace config to an RS2 tenant config |
+| `rs2 catalogue-dump` | Print the service config catalogue — the same document a running node serves at `GET /<services>/catalogue` — as pretty JSON on stdout. No server, no arguments: it dumps the catalogue compiled into the CLI. Use it to diff or check in the config schemas offline; the Cloudflare host checks the output in as a fixture so both hosts serve byte-identical schemas |
 | `rs2 login [--host <url>] [--email <e>] [--password <p>]` | Authenticate against `POST {host}/auth/login` and save the returned token to `rsconfig.json`. Missing flags fall back to `rsconfig.json` (`host`, `login.email`, `login.password`); the password also reads from `RS2_PASSWORD` |
 | `rs2 send <path> --file <local> [--content-type <ct>]` | `PUT` a local file to `{host}{path}`, sending the saved bearer token if one is valid (it is not required — the server enforces access, so an open mount accepts an anonymous send; a 401/403 hints to `rs2 login`). Content-type is inferred from the file extension unless `--content-type` is given. Prints `created` (201) or `overwritten` (200) |
 | `rs2 service add <mount.json> [--path <p>]` | Add a mount to the running tenant via the self-config API. Reads `GET /services/raw` (with its ETag), appends the mount spec, and `PUT`s it back `If-Match`. The path is `--path` or the file's `path`; **fails if a mount already occupies that exact path** (nothing changes). Sends the saved token if valid but doesn't require it (so an open `/services` can be configured before any admin exists) |
@@ -178,7 +179,7 @@ The granular verbs (`auth enable` → `auth create-admin` → `login` → … �
 
 `logging` is optional (operator-level — *where logs physically go* is node infra, not tenant config; defaults to a `file` sink at `./logs`). `sink`: `"file"` writes per-tenant NDJSON (`<path>/<tenant>.ndjson`, size-rotated with `backups`), `"none"` disables. `level` is the boundary-log floor (`debug\|info\|warn\|error`); 5xx always emit regardless. Expose them per tenant with a `{"service":"log"}` mount (see `services.md`); the `X-Trace-Id` response header correlates a response to its log line.
 
-Server feature builds matter: the standard server wires the outbound HTTP adapter; engines are compile-time features (`wasm`, `js`) — a build without one serves `code:` mounts of that type as 501 `engine_unavailable` at request time (config stays valid).
+Server feature builds matter: the standard server wires the outbound HTTP adapter; engines are compile-time features (`wasm`, `js`) — a build without one serves `code:` mounts of that type as 501 `engine_unavailable` at request time (config stays valid). The Cloudflare host has no Wasm engine at all, so a Wasm bundle is always that 501 there (`http-api.md` → "Hosts").
 
 ## Production deployment (Ubuntu + Apache)
 
@@ -194,6 +195,23 @@ sudo certbot --apache -d api.example.com   # issue the cert (interactive)
 A release ships **server binaries only** — there is no prebuilt `rs2` CLI to download. Build it from the workspace: `cargo build --release -p rs2-cli`, binary at `target/release/rs2`.
 
 The installer runs the node as a dedicated `rs2` system user with config under `/etc/rs2`, data under `/var/lib/rs2`, and logs under `/var/log/rs2`; it never overwrites an existing config on re-install (re-running just upgrades the binary). Two release variants exist — `rs2-server` (wasm) and `rs2-server-js` (adds V8) — picked with `--js`. **The Apache vhost must set `ProxyPreserveHost On`**: RS2 resolves tenancy from the `Host` header, so a proxy that rewrites Host sends every request to the wrong tenant. WebSockets are out of scope, so no ws-tunnel module is needed. Details and manual steps: `deploy/README.md` in the runtime repo.
+
+## The Cloudflare host (`rs2-worker/`)
+
+The second host of the same API (see `http-api.md` → "Hosts") is a TypeScript Worker in `rs2-worker/` in the runtime repo; **that directory's `README.md` is the operator's card** and this is the short version. It has no `serverConfig.json`, no `tenantsDir` and no disk: everything `serverConfig.json` holds is either a wrangler var or the admin API.
+
+```sh
+cd rs2-worker
+npm ci
+npm run dev                              # wrangler dev on http://127.0.0.1:8787 (local R2, SQLite, alarms, cron)
+npx wrangler secret put RS2_ADMIN_TOKEN  # gates /admin/* — required for the admin API
+npm run deploy                           # wrangler deploy
+```
+
+- **Vars** (in `wrangler.jsonc`, overridable per environment): `RS2_DEFAULT_TENANT` (single-tenant/local mode — any host resolves to it; **unset it in multi-tenant production**), `RS2_MAIN_DOMAIN` (the `<sub>.<mainDomain>` tenancy rule), `RS2_LOG_LEVEL`, `RS2_CATALOGUE_HOSTS` (the comma-separated equivalent of `serverConfig.catalogueHosts`).
+- **Secrets**: `RS2_ADMIN_TOKEN` (the same gate as `POST /admin/reload-infras` on the Rust node), plus optional `CF_API_TOKEN` (a token with Zone → SSL and Custom Hostnames edit) and `CF_ZONE_ID`. With both set, `PUT /admin/domains/<host>` also provisions a Cloudflare for SaaS custom hostname and reports the provisioning status and CNAME target; without them the domain endpoints manage the registry map only.
+- **Provision a tenant** with `PUT /admin/tenants/<name>` — `{"config": {…the same tenant config document…}, "domains": [...], "bootstrapAdmin": {"email","password"}}` — the replacement for dropping a `tenants/<name>.json` on disk. Infras go in with `PUT /admin/infras` instead of `infras.json`. Full endpoint list: `http-api.md` → "Hosts".
+- Once a tenant exists, everything else is the ordinary HTTP API: `rs2 login`, `send`, `service add`, `deploy`, `pull`/`push` all work against a Worker host unchanged — point `rsconfig.json` `host` at it.
 
 ## Tenant config (`tenants/<name>.json` or `PUT /services/raw`)
 

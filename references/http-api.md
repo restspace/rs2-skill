@@ -4,13 +4,46 @@
 
 Tenancy is `single` (every request belongs to the configured tenant) or `multi` (tenant resolved from the Host header: explicit domain map first, then `{tenant}.{mainDomain}` subdomain). Ops endpoints `GET /healthz` and `GET /readyz` are tenant-independent, as is `POST /admin/reload-infras` (node admin token via `Authorization: Bearer`/`X-Admin-Token`; reloads operator infras with no restart → `{loaded, names}`; disabled 503 when no token configured — see `cli.md` → "Infras"). Per-tenant, `GET /services/infras` lists the infras a tenant may consume (secrets redacted; see `services.md`).
 
-Paths are safety-validated before routing: traversal (`..`, encoded variants), null bytes, backslashes, control characters, and drive letters are rejected with 400 `path_unsafe` for **all** services. Longest mount prefix wins, on segment boundaries.
+Paths are safety-validated before routing: traversal (`..`, encoded variants), null bytes, backslashes, control characters, and drive letters are rejected with 400 `path_unsafe` for **all** services. Longest mount prefix wins, on segment boundaries. (On the Cloudflare host the platform canonicalizes dot segments before the Worker sees the request, so `/files/../x` routes on the normalized path — 404 for an unmounted target — instead of 400 `path_unsafe`; null bytes, backslashes, control characters, and drive letters still reach the router and are 400.)
+
+## Hosts
+
+The RS2 HTTP API has **two implementations**: the Rust server (`rs2-server`) and a TypeScript Worker running natively on Cloudflare Workers (`rs2-worker/` in the runtime repo — one stateless Worker in front of one Durable Object per tenant, R2 for files, DO SQLite for data/idempotency/logs). Every status code, header name, JSON field, error `code`, and listing shape is the same on both, including the odd corners; a black-box conformance runner asserts it. **Identify the host by reading `limits.host` on `GET /.well-known/rs2/services`** (`"rust"` | `"cloudflare"`) — never by probing behaviour.
+
+The differences are declared, not discovered:
+
+| Difference on the Cloudflare host | How it shows up |
+| --- | --- |
+| **No Wasm engine** — JS bundles only | a `code:` mount whose bundle is Wasm answers **501** `engine_unavailable` at first request; the `code` entry in `GET /services/catalogue` lists `engines: ["js"]` |
+| **Guest capabilities are async** | every `code:` mount advertises the **`guest-async`** facet: `ctx.request`, `ctx.state.get/put`, `ctx.readBody`, `ctx.body()` and `ctx.beginStream(...).write` return Promises, so bundles must `await` them (`ctx.log` stays synchronous). A bundle that awaits works on **both** hosts. Timers are real, not virtual, and platform globals are not shadowed — see `custom-services.md` |
+| **Per-invocation ceilings** | memory is the platform's fixed 128 MiB; materialized bodies cap at 32 MiB (100 MB on Rust); guest budgets are CPU time via the Worker-only mount field `limits.cpuMs` (default 5 000, ceiling 30 000), breaches reported as `limit_exceeded` with `limit: "wall_clock_ms"`. All readable in the `limits` object below |
+| **Opaque validators differ** | `ETag` values and the config version are different strings on the two hosts — they are opaque by contract, so round-trip them and never parse or compare across hosts |
+| **`conditional-write` is atomic** | the facet is the same; the Cloudflare host serializes the check-and-put in the tenant's Durable Object, where the Rust local-fs store is best-effort. Client behaviour (send `If-Match`, handle 412) is identical |
+| **`DELETE` of a directory that never existed → 204** | R2 has no directories; the Rust local-fs store answers 404. Accept `204|404` |
+| **`builtin:mem` is durable** | it is DO-SQLite-backed there, not ephemeral — don't rely on it being wiped |
+| **Guest (`code:`) store adapters don't pool connections across requests** | see `custom-services.md` → "Loadable adapters" |
+
+Everything else — including `Content-Range` being omitted on 206, `If-Match` mismatch on `PUT /services/raw` being 409 not 412, and conditional headers being ignored on data `PATCH`/keyless `POST` — is reproduced exactly on both hosts.
+
+**Operator endpoints.** `GET /healthz`, `GET /readyz` and `POST /admin/reload-infras` exist on both, with the same admin-token gate. The Rust node's operator surface otherwise is **files on disk** (`tenants/<name>.json`, `infras.json`); the Cloudflare host, which has no disk, exposes the equivalent as a **Worker-only admin API** on the same gate (`RS2_ADMIN_TOKEN`, presented as `Authorization: Bearer` or `X-Admin-Token`; no token configured → 503, bad token → 401). Bodies and responses are JSON, errors problem+json with `tenant: "-"`:
+
+| Endpoint (Cloudflare host only) | Does |
+| --- | --- |
+| `GET /admin/tenants` | `{"tenants": [{"name", "domains": [...], "configVersion"}]}` |
+| `PUT /admin/tenants/<name>` | Create/replace a tenant: `{"config": <tenant config>, "domains": ["api.acme.com"], "bootstrapAdmin": {"email","password"}?}`. Validates the name (`/`, `\`, `.` → 400), dry-builds the config (same errors as `PUT /services/raw`), registers the domains, and seeds the bootstrap admin **if absent** (needs `auth.jwtSecret`, else 400). 201 created / 200 replaced, with an `ETag` |
+| `GET /admin/tenants/<name>` | The raw config, redacted like `/services/raw` |
+| `DELETE /admin/tenants/<name>?confirm=<name>` | Removes the registry entries and deletes the tenant's Durable Object storage (409 without `confirm`). Stored **files are not deleted** |
+| `PUT /admin/domains/<host>` | `{"tenant"}` — maps a host to a tenant (host lowercased). With the `CF_API_TOKEN` + `CF_ZONE_ID` secrets set it also provisions a Cloudflare for SaaS custom hostname and the response carries the provisioning status and the CNAME target to point DNS at; without them it manages the registry map only and says so |
+| `DELETE /admin/domains/<host>` | 204 |
+| `PUT /admin/infras` | Store the `infras.json` document (the Rust node reads the file instead) |
+
+Only these exact paths are claimed by the Worker — any other `/admin/*` path routes to tenant mounts as usual, so a tenant mount at `/admin` works on both hosts. Deploying the Worker host: `cli.md` → "The Cloudflare host".
 
 ## Discovery surface (read-only, generated)
 
 | Endpoint | Returns |
 | --- | --- |
-| `GET /.well-known/rs2/services` | `{tenant, services: [{path, service, pattern, facets?, x-agent?, x-policy?, x-expose?, description?}], control}` — only mounts the caller may read. `pattern` (`store` \| `store-view` \| `transform` \| `api`) is the conversation shape for polymorphic clients; `facets` are optional capabilities within it (see `services.md`). `control` points a generic admin client at the management surface (the `services` mount, mountable anywhere): `{path, config, catalogue, mounts, code}` with ready-made URLs, or `null` when no such mount is readable. Filter with `?surface=<name>` against mount `x-expose`, same semantics as agent-surface (string or array; absent = exposed everywhere; no param = unfiltered) — `control` follows its backing mount, so it is `null` when the `services` mount is scoped off the requested surface. e.g. `?surface=editor` yields a content-editing client's view |
+| `GET /.well-known/rs2/services` | `{tenant, services: [{path, service, pattern, facets?, x-agent?, x-policy?, x-expose?, description?}], control, limits}` — only mounts the caller may read. `limits` is the host's per-invocation ceilings and which host is answering (see "Limits and containment"). `pattern` (`store` \| `store-view` \| `transform` \| `api`) is the conversation shape for polymorphic clients; `facets` are optional capabilities within it (see `services.md`). `control` points a generic admin client at the management surface (the `services` mount, mountable anywhere): `{path, config, catalogue, mounts, code}` with ready-made URLs, or `null` when no such mount is readable. Filter with `?surface=<name>` against mount `x-expose`, same semantics as agent-surface (string or array; absent = exposed everywhere; no param = unfiltered) — `control` follows its backing mount, so it is `null` when the `services` mount is scoped off the requested surface. e.g. `?surface=editor` yields a content-editing client's view |
 | `GET /.well-known/rs2/agent-surface` | `{entities, actions, queries}`; actions carry `effect` and `idempotency: {header: "Idempotency-Key", honored: true}`; queries carry their `params` JSON Schema; actions/entities carry `inputSchema`/`outputSchema` when declared (wrapper config, pipeline envelope `input`/`output`, or a `code:` mount's deploy manifest); filter with `?surface=<name>` against mount `x-expose` (string or array; absent = exposed everywhere) |
 | `GET /.well-known/rs2/openapi` | OpenAPI 3.1; operations carry `x-effect` and `x-idempotency-key`, and advertise their request/response media types as `content`; stored-query param schemas are the request-body schemas; each installed **dataset schema is inlined** under `components.schemas` with a concrete `{dataset}/{key}` path `$ref`-ing it (the same schema the data service enforces — no second fetch, no drift); wrapper/pipeline/`code:` mounts bind their declared I/O schemas; `components.schemas.Problem` describes errors |
 
@@ -128,6 +161,22 @@ Pipeline failures merge a `pipeline` object into the problem body: `{"failedStep
 ## Limits and containment
 
 Per-invocation/per-tenant defaults (operator-configurable): wall clock 30 s (service) / 120 s (pipeline), 128 MB memory, 100 MB materialized body, 64 concurrent invocations per tenant (excess fails fast 503, no queueing), 64 outbound calls per invocation, call depth 16, pipeline fan-out 1000.
+
+The ceilings the answering host actually enforces are published on the discovery surface, so a client never has to assume them — `GET /.well-known/rs2/services` carries a top-level `limits` object (both hosts, same field names; only the values and `host` differ):
+
+```json
+"limits": { "wallClockMs": 30000, "memoryBytes": 134217728, "materializedBodyBytes": 104857600,
+            "outboundCalls": 64, "maxDepth": 16, "host": "rust" }
+```
+
+| Field | Means |
+| --- | --- |
+| `wallClockMs` | the per-service-invocation wall-clock ceiling (breaches → `limit: "wall_clock_ms"`) |
+| `memoryBytes` | the per-invocation memory cap (128 MiB, fixed by the platform on the Cloudflare host) |
+| `materializedBodyBytes` | the largest body the host will materialize (100 MB on Rust, 32 MiB on Cloudflare) |
+| `outboundCalls` | the outbound-call budget per invocation |
+| `maxDepth` | the call-depth ceiling |
+| `host` | which implementation is answering: `"rust"` or `"cloudflare"` (see "Hosts") |
 
 Breaches return `limit_exceeded` naming the limit. Repeated resource breaches (default 8 within 10 s) trip a per-tenant circuit breaker: subsequent requests fail fast with `limit: "tenant_breaker"` and `Retry-After` for the cooldown (default 5 s). Admission rejections do not feed the breaker; genuine wall-clock/memory/materialization breaches do.
 

@@ -5,7 +5,7 @@ description: This skill should be used when the user asks to inspect, call, or c
 
 # RS2 (Restspace 2)
 
-An RS2 server is a Rust runtime hosting composable HTTP services, each mounted on a root path per tenant. Custom code runs sandboxed (V8 isolates for JS, Wasmtime components for Rust/Wasm) with default-deny capabilities and hard resource limits. Example tenant:
+An RS2 server hosts composable HTTP services, each mounted on a root path per tenant. Custom code runs sandboxed (V8 isolates for JS, Wasmtime components for Rust/Wasm) with default-deny capabilities and hard resource limits. Example tenant:
 
 ```
 /files     File store (streamed)
@@ -17,6 +17,8 @@ An RS2 server is a Rust runtime hosting composable HTTP services, each mounted o
 /services  Self-configuration API
 /pay       code:stripe-wrapper@a1b2c3 (sandboxed custom service)
 ```
+
+**Two hosts, one API.** RS2 ships two implementations of that API: the Rust server (`rs2-server`) and a TypeScript Worker running natively on Cloudflare Workers (`rs2-worker/`). Every status code, header, JSON field, error `code`, and listing shape is the same — the CLI, UIs, and agents work unchanged against either — and a black-box conformance suite holds both to it. Tell them apart by reading `limits.host` (`"rust"` | `"cloudflare"`) on `GET /.well-known/rs2/services`; feature-detect the handful of declared differences (Wasm bundles, guest async, per-invocation ceilings, adapter pooling) rather than assuming a host. See `http-api.md` → "Hosts".
 
 The `rs2` CLI covers the developer loop — scaffold, run a local node, validate, deploy bundles, migrate v1 configs — plus a few admin/ops commands that drive a running server: `login`, `send` (PUT a local file to a path), `service add` (add a mount via the self-config API), and `run` (a script of `rs2` lines). These read a saved server identity from `rsconfig.json`. For anything they don't cover, interact with a tenant over **plain HTTP** (curl, `Invoke-RestMethod`). See `references/cli.md`.
 
