@@ -15,8 +15,8 @@ The differences are declared, not discovered:
 | Difference on the Cloudflare host | How it shows up |
 | --- | --- |
 | **No Wasm engine** — JS bundles only | a `code:` mount whose bundle is Wasm answers **501** `engine_unavailable` at first request; the `code` entry in `GET /services/catalogue` lists `engines: ["js"]` |
-| **Guest capabilities are async** | every `code:` mount advertises the **`guest-async`** facet: `ctx.request`, `ctx.state.get/put`, `ctx.readBody`, `ctx.body()` and `ctx.beginStream(...).write` return Promises, so bundles must `await` them (`ctx.log` stays synchronous). A bundle that awaits works on **both** hosts. Timers are real, not virtual, and platform globals are not shadowed — see `custom-services.md` |
-| **Per-invocation ceilings** | memory is the platform's fixed 128 MiB; materialized bodies cap at 32 MiB (100 MB on Rust); guest budgets are CPU time via the Worker-only mount field `limits.cpuMs` (default 5 000, ceiling 30 000), breaches reported as `limit_exceeded` with `limit: "wall_clock_ms"`. All readable in the `limits` object below |
+| **Guest capabilities are async** | every `code:` mount's entry in `GET /.well-known/rs2/services` carries the **`guest-async`** facet: `ctx.request`, `ctx.state.get/put`, `ctx.readBody`, `ctx.body()` and `ctx.beginStream(...).write` return Promises, so bundles must `await` them (`ctx.log` stays synchronous). A bundle that awaits works on **both** hosts. Timers are real, not virtual, and platform globals are not shadowed — see `custom-services.md` |
+| **Per-invocation ceilings** | memory is the platform's fixed 128 MiB; materialized bodies cap at 32 MiB (100 MB on Rust); guest budgets are CPU time via the Worker-only mount config field `"config": {"limits": {"cpuMs": 5000}}` (default 5 000, ceiling 30 000; ignored by the Rust host), breaches reported as `limit_exceeded` with `limit: "wall_clock_ms"`. All readable in the `limits` object below |
 | **Opaque validators differ** | `ETag` values and the config version are different strings on the two hosts — they are opaque by contract, so round-trip them and never parse or compare across hosts |
 | **`conditional-write` is atomic** | the facet is the same; the Cloudflare host serializes the check-and-put in the tenant's Durable Object, where the Rust local-fs store is best-effort. Client behaviour (send `If-Match`, handle 412) is identical |
 | **`DELETE` of a directory that never existed → 204** | R2 has no directories; the Rust local-fs store answers 404. Accept `204|404` |
@@ -34,7 +34,8 @@ Everything else — including `Content-Range` being omitted on 206, `If-Match` m
 | `GET /admin/tenants/<name>` | The raw config, redacted like `/services/raw` |
 | `DELETE /admin/tenants/<name>?confirm=<name>` | Removes the registry entries and deletes the tenant's Durable Object storage (409 without `confirm`). Stored **files are not deleted** |
 | `PUT /admin/domains/<host>` | `{"tenant"}` — maps a host to a tenant (host lowercased). With the `CF_API_TOKEN` + `CF_ZONE_ID` secrets set it also provisions a Cloudflare for SaaS custom hostname and the response carries the provisioning status and the CNAME target to point DNS at; without them it manages the registry map only and says so |
-| `DELETE /admin/domains/<host>` | 204 |
+| `GET /admin/domains/<host>` | The mapping (`{"host", "tenant", …}`) plus the current provisioning status when the Cloudflare for SaaS secrets are set; 404 for an unknown host |
+| `DELETE /admin/domains/<host>` | 204 (also removes the custom hostname when the secrets are set) |
 | `PUT /admin/infras` | Store the `infras.json` document (the Rust node reads the file instead) |
 
 Only these exact paths are claimed by the Worker — any other `/admin/*` path routes to tenant mounts as usual, so a tenant mount at `/admin` works on both hosts. Deploying the Worker host: `cli.md` → "The Cloudflare host".
