@@ -33,7 +33,7 @@ Everything else — including `Content-Range` being omitted on 206, `If-Match` m
 | `PUT /admin/tenants/<name>` | Create/replace a tenant: `{"config": <tenant config>, "domains": ["api.acme.com"], "bootstrapAdmin": {"email","password"}?}`. Validates the name (`/`, `\`, `.` → 400), dry-builds the config (same errors as `PUT /services/raw`), registers the domains, and seeds the bootstrap admin **if absent** (needs `auth.jwtSecret`, else 400). 201 created / 200 replaced, with an `ETag` |
 | `GET /admin/tenants/<name>` | The raw config, redacted like `/services/raw` |
 | `DELETE /admin/tenants/<name>?confirm=<name>` | Removes the registry entries and deletes the tenant's Durable Object storage (409 without `confirm`). Stored **files are not deleted** |
-| `PUT /admin/domains/<host>` | `{"tenant"}` — maps a host to a tenant (host lowercased). With the `CF_API_TOKEN` + `CF_ZONE_ID` secrets set it also provisions a Cloudflare for SaaS custom hostname and the response carries the provisioning status and the CNAME target to point DNS at; without them it manages the registry map only and says so |
+| `PUT /admin/domains/<host>` | `{"tenant"}` — maps a host to a tenant (host lowercased; a malformed host name is a 400, and the same check applies to the `domains` array above). With the `CF_API_TOKEN` + `CF_ZONE_ID` secrets set it also provisions a Cloudflare for SaaS custom hostname **before** the mapping is written — so a Cloudflare failure leaves routing untouched — and the response carries the provisioning status and the CNAME target to point DNS at; without them it manages the registry map only and says so |
 | `GET /admin/domains/<host>` | The mapping (`{"host", "tenant", …}`) plus the current provisioning status when the Cloudflare for SaaS secrets are set; 404 for an unknown host |
 | `DELETE /admin/domains/<host>` | 204 (also removes the custom hostname when the secrets are set) |
 | `PUT /admin/infras` | Store the `infras.json` document (the Rust node reads the file instead) |
@@ -176,7 +176,7 @@ The ceilings the answering host actually enforces are published on the discovery
 | `memoryBytes` | the per-invocation memory cap (128 MiB, fixed by the platform on the Cloudflare host) |
 | `materializedBodyBytes` | the largest body the host will materialize (100 MB on Rust, 32 MiB on Cloudflare) |
 | `outboundCalls` | the outbound-call budget per invocation |
-| `maxDepth` | the call-depth ceiling |
+| `maxDepth` | the call-depth ceiling; every internal hop — a pipeline step, a guest's `ctx.request`/`fetch` — counts one |
 | `host` | which implementation is answering: `"rust"` or `"cloudflare"` (see "Hosts") |
 
 Breaches return `limit_exceeded` naming the limit. Repeated resource breaches (default 8 within 10 s) trip a per-tenant circuit breaker: subsequent requests fail fast with `limit: "tenant_breaker"` and `Retry-After` for the cooldown (default 5 s). Admission rejections do not feed the breaker; genuine wall-clock/memory/materialization breaches do.
