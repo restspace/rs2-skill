@@ -179,6 +179,8 @@ The ceilings the answering host actually enforces are published on the discovery
 | `maxDepth` | the call-depth ceiling; every internal hop — a pipeline step, a guest's `ctx.request`/`fetch` — counts one |
 | `host` | which implementation is answering: `"rust"` or `"cloudflare"` (see "Hosts") |
 
+The numbers above are defaults: an operator sets them per deployment (Rust: `serverConfig.limits`; Cloudflare: the `RS2_LIMITS` var), so read them from discovery rather than assuming. A deployment whose platform enforces a tighter ceiling than RS2's own is expected to lower the matching limit — on Workers Free, for instance, `outboundCalls` goes below the platform's 50-subrequest cap so an overrun is RS2's own `limit_exceeded` rather than a platform error.
+
 Breaches return `limit_exceeded` naming the limit. Repeated resource breaches (default 8 within 10 s) trip a per-tenant circuit breaker: subsequent requests fail fast with `limit: "tenant_breaker"` and `Retry-After` for the cooldown (default 5 s). Admission rejections do not feed the breaker; genuine wall-clock/memory/materialization breaches do.
 
 ## Calling from PowerShell
