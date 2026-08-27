@@ -33,10 +33,33 @@ Everything else — including `Content-Range` being omitted on 206, `If-Match` m
 | `PUT /admin/tenants/<name>` | Create/replace a tenant: `{"config": <tenant config>, "domains": ["api.acme.com"], "bootstrapAdmin": {"email","password"}?}`. Validates the name (`/`, `\`, `.` → 400), dry-builds the config (same errors as `PUT /services/raw`), registers the domains, and seeds the bootstrap admin **if absent** (needs `auth.jwtSecret`, else 400). 201 created / 200 replaced, with an `ETag` |
 | `GET /admin/tenants/<name>` | The raw config, redacted like `/services/raw` |
 | `DELETE /admin/tenants/<name>?confirm=<name>` | Removes the registry entries and deletes the tenant's Durable Object storage (409 without `confirm`). Stored **files are not deleted** |
-| `PUT /admin/domains/<host>` | `{"tenant"}` — maps a host to a tenant (host lowercased; a malformed host name is a 400, and the same check applies to the `domains` array above). With the `CF_API_TOKEN` + `CF_ZONE_ID` secrets set it also provisions a Cloudflare for SaaS custom hostname **before** the mapping is written — so a Cloudflare failure leaves routing untouched — and the response carries the provisioning status and the CNAME target to point DNS at; without them it manages the registry map only and says so |
-| `GET /admin/domains/<host>` | The mapping (`{"host", "tenant", …}`) plus the current provisioning status when the Cloudflare for SaaS secrets are set; 404 for an unknown host |
-| `DELETE /admin/domains/<host>` | 204 (also removes the custom hostname when the secrets are set) |
+| `PUT /admin/domains/<host>` | `{"tenant"}` — **claims** a host for a tenant (host lowercased; a malformed host name is a 400, and the same check applies to the `domains` array above). See "Attaching a customer's domain" below: **202** when it is not proven yet (and it does not route), 200 when it already is, 409 when another tenant holds the claim or the mapping |
+| `GET /admin/domains` | `{"domains": [{"host", "tenant", "status"}]}` — live mappings and unproven claims, sorted |
+| `GET /admin/domains/<host>` | The attachment; re-polls a pending one and promotes it if it has since been proven. 404 for an unknown host |
+| `DELETE /admin/domains/<host>` | 204 — drops the mapping **and** any unproven claim, and removes what the provider provisioned |
 | `PUT /admin/infras` | Store the `infras.json` document (the Rust node reads the file instead) |
+
+### Attaching a customer's domain
+
+A tenant can be served at a domain its owner controls (`app.acme.com`). The customer publishes **one CNAME**; nothing routes until the DNS proves them right.
+
+`PUT /admin/domains/app.acme.com` with `{"tenant": "acme"}` answers **202** and:
+
+```json
+{ "host": "app.acme.com", "tenant": "acme", "status": "pending",
+  "dnsRecords": [ { "type": "CNAME", "name": "app.acme.com", "value": "saas.rs2.example",
+                    "required": true, "purpose": "routes the domain to this deployment" } ],
+  "nextStep": "publish the required DNS record above at app.acme.com's DNS provider; …",
+  "provider": { "name": "cloudflare-saas", "detail": { "cfStatus": "pending" } } }
+```
+
+Read `status` (`pending` | `active`), `dnsRecords` and `nextStep` — those are the same on every host and every provider. `provider.detail` is diagnosis for a human when a domain is stuck; never parse it.
+
+A **claim is not a mapping**. The host starts routing only when the provider reports control of the DNS proven — checked on every `GET` of the attachment, and by a minutely reconcile for the customer who publishes the record and never comes back to look. Two tenants may claim the same host; only the one whose DNS resolves gets it. `DELETE` releases a claim.
+
+Which provider runs is deployment configuration: `cloudflare-saas` when the `CF_API_TOKEN` + `CF_ZONE_ID` secrets are set (Cloudflare validates the hostname and issues the certificate), otherwise `manual`, which proves control by fetching `http://<host>/.well-known/rs2/domain-challenge/<token>` — a path only that deployment can answer — and leaves TLS to whatever sits in front.
+
+**On the Rust node** the read endpoints exist and answer identically (`provider: {"name": "static"}`), because its tenancy map is `serverConfig.json` → `tenancy.domainMap`, read at startup. `PUT`/`DELETE` there answer **501 `provider_unavailable`** naming that file: attach the domain by editing it and restarting, and give the certificate to your reverse proxy.
 
 Only these exact paths are claimed by the Worker — any other `/admin/*` path routes to tenant mounts as usual, so a tenant mount at `/admin` works on both hosts. Deploying the Worker host: `cli.md` → "The Cloudflare host".
 
