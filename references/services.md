@@ -171,16 +171,52 @@ Forward every request on the mount to a fixed external `target`, attaching crede
 
 Strategies: `bearer` (`token`), `header` (`name`,`value`), `basic` (`username`,`password`), `query` (`name`,`value`), `hmac` (`algorithm`,`secret`,`header` — signs the request body), `awsSigV4` (`accessKeyId`,`secretAccessKey`,`region`,`service`). Header/query/bearer/basic leave a streaming body untouched; `hmac`/`awsSigV4` materialize it to sign. The secret never appears in `GET /services/raw`.
 
-## sms — outbound SMS over a swappable provider (`api`)
+## message — outbound email and SMS over swappable providers (`api`; facet: `channels`)
 
-A typed provider capability: the canonical `POST /send {to, body}` / `GET /status/{id}` surface, backed by a provider adapter you pick per mount. Swapping Twilio for SNS is a `store.adapter` change — the service is unchanged.
+A typed provider capability: one canonical surface for every delivery channel,
+backed by provider adapters you pick per mount. Swapping one provider for
+another is a `store.adapter` change — the service is unchanged.
 
 ```json
-{ "path": "/sms", "service": "sms",
-  "config": { "store": { "adapter": "code:twilio@v1" } } }
+{ "path": "/msg", "service": "message",
+  "config": { "store": { "adapters": { "email": "infra:cf-email",
+                                       "sms":   "infra:aws-sms" } } } }
 ```
 
-`POST /sms/send` with `{"to":"+1…","body":"…"}` → `201 {"id":…}`; `GET /sms/status/<id>` → provider-shaped delivery status. The provider is a deployed JS adapter (`code:<name>@<version>`, or `infra:<name>`); it maps the canonical request to the provider's wire format and uses an `httpOut`/socket grant (with `inject`, above) for the provider's auth — so the secret stays host-side. No first-party SMS providers ship yet, so `builtin:` is rejected; use a `code:` adapter (see `custom-services.md`). This is the reference pattern for typed provider capabilities (email, signing, … follow the same shape).
+- `POST /msg/send` — the body is channel-tagged:
+  - email: `{"channel":"email","to":["a@b.com"],"subject":"…","text":"…","html":"…"}`
+    (`to`/`cc`/`bcc` take an address string, a `{email,name}` object, or an array
+    of either; also `from`, `replyTo`, `attachments[{filename,contentType,content,contentId}]`
+    with base64 `content`, and `headers`). Combined recipients cap at **50**.
+  - sms: `{"channel":"sms","to":"+447700900000","text":"…"}` (optional `from`).
+  - → `201 {"id"?, "channel", "provider", "detail"?}`.
+- `GET /msg/status/<id>` — provider-shaped delivery status, or **501
+  `provider_unavailable`** when the configured provider does not report it.
+- `GET /msg/channels` — `{"channels":[…],"deliveryStatus":bool,"provider":"…"}`:
+  what this mount can actually do. Ask this rather than assuming.
+
+**Two things are deliberately not universal**, because providers differ and the
+surface says so rather than pretending otherwise:
+
+- **`id` may be absent.** A provider that reports delivery in the send response
+  (Cloudflare) mints no message id and returns `detail` instead; one that queues
+  (AWS SNS) returns an id.
+- **`deliveryStatus` may be `false`.** SNS has no per-message status API;
+  Cloudflare already answered at send time. Either way `GET /status/{id}` is a
+  501 naming the provider, not a fabricated answer.
+
+**Providers.** First-party built-ins: `builtin:cf-email` (Cloudflare Email
+Service — `accountId`, optional `from`/`fromName`, and a `bearer` credential) and
+`builtin:aws-sns` (`region`, optional `senderId`/`smsType`, and `awsSigV4`
+credentials). Put the credentials in an operator `infra:<name>` so they never
+land in tenant config. A `code:<name>@<version>` adapter works too, declaring
+`channels` and `deliveryStatus` in its store block (see `custom-services.md`).
+
+**One mount, several providers.** `store.adapter` names a single adapter;
+`store.adapters` maps `channel → adapter` (an adapter string, or a full store
+block) and routes each send by its channel. Setting both is a 400, as is routing
+an adapter at a channel it does not serve — both caught when the config is
+written, not on the first send.
 
 ## query — stored parameterized queries (`store-view`; facets: `positional-params`, `url-params`, `any-verb`, `meta-sort`)
 
