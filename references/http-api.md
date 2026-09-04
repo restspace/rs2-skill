@@ -23,7 +23,7 @@ The differences are declared, not discovered:
 | **`builtin:mem` is durable** | it is DO-SQLite-backed there, not ephemeral — don't rely on it being wiped |
 | **Guest (`code:`) store adapters don't pool connections across requests** | see `custom-services.md` → "Loadable adapters" |
 
-Everything else — including `Content-Range` being omitted on 206, `If-Match` mismatch on `PUT /services/raw` being 409 not 412, and conditional headers being ignored on data `PATCH`/keyless `POST` — is reproduced exactly on both hosts.
+Everything else — including `If-Match` mismatch on `PUT /services/raw` being 409 not 412, and conditional headers being ignored on data `PATCH`/keyless `POST` — is reproduced exactly on both hosts.
 
 **Operator endpoints.** `GET /healthz`, `GET /readyz` and `POST /admin/reload-infras` exist on both, with the same admin-token gate. The Rust node's operator surface otherwise is **files on disk** (`tenants/<name>.json`, `infras.json`); the Cloudflare host, which has no disk, exposes the equivalent as a **Worker-only admin API** on the same gate (`RS2_ADMIN_TOKEN`, presented as `Authorization: Bearer` or `X-Admin-Token`; no token configured → 503, bad token → 401). Bodies and responses are JSON, errors problem+json with `tenant: "-"`:
 
