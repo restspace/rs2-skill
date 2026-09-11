@@ -1,6 +1,6 @@
 # The `rs2` CLI, server config, and v1 migration
 
-The `rs2` CLI covers both the **developer loop** (scaffold, run, validate, deploy, migrate) and a small set of **admin/ops** commands that drive a running server (`login`, `send`, `service add`, `service set-access`, `auth …`, `pull`, `push`, `run`). The admin commands read a saved server identity from `rsconfig.json` (see below); for anything they don't cover, call tenants over HTTP directly (`http-api.md`).
+The `rs2` CLI covers both the **developer loop** (scaffold, run, validate, deploy, migrate) and a small set of **admin/ops** commands that drive a running server (`login`, `send`, `service add`, `service set-access`, `auth …`, `pull`, `push`, `sync`, `run`). The admin commands read a saved server identity from `rsconfig.json` (see below); for anything they don't cover, call tenants over HTTP directly (`http-api.md`).
 
 ## Verbs
 
@@ -12,7 +12,7 @@ The `rs2` CLI covers both the **developer loop** (scaffold, run, validate, deplo
 | `rs2 deploy <file> --name <n> [--server <url>] [--token <t>] [--bundle]` | Keyless upload to `POST <server>/code/<n>/` (the content-addressed store derives the version; a `PUT` needs an explicit `<name>/<version>`). `.js`/`.mjs` deploys as a JS bundle; `\0asm` files as components. `--bundle` first runs `npx esbuild <file> --bundle --format=esm --platform=browser` (npm deps resolve at build time; native addons fail there). Both `--server` and `--token` default from `rsconfig.json` — `host` + `/services` (else `http://127.0.0.1:3100/services`), and the unexpired token `rs2 login` saved for that host |
 | `rs2 migrate <services.json> [-o tenant.json]` | Convert a v1 Restspace config to an RS2 tenant config |
 | `rs2 catalogue-dump` | Print the service config catalogue — the same document a running node serves at `GET /<services>/catalogue` — as pretty JSON on stdout. No server, no arguments: it dumps the catalogue compiled into the CLI. Use it to diff or check in the config schemas offline; the Cloudflare host checks the output in as a fixture so both hosts serve byte-identical schemas |
-| `rs2 login [--host <url>] [--email <e>] [--password <p>]` | Authenticate against `POST {host}/auth/login` and save the returned token to `rsconfig.json`. Missing flags fall back to `rsconfig.json` (`host`, `login.email`, `login.password`); the password also reads from `RS2_PASSWORD` |
+| `rs2 login [--server <name>] [--host <url>] [--email <e>] [--password <p>]` | Authenticate against `POST {host}/auth/login` and save the returned token to `rsconfig.json`. Missing flags fall back to `rsconfig.json` (`host`, `login.email`, `login.password`); the password also reads from `RS2_PASSWORD`. With `--server <name>` the token is saved under `servers.<name>` instead of the default `host`/`auth` (a new name needs `--host` once), so two servers can be logged in at the same time for `rs2 sync` |
 | `rs2 send <path> --file <local> [--content-type <ct>]` | `PUT` a local file to `{host}{path}`, sending the saved bearer token if one is valid (it is not required — the server enforces access, so an open mount accepts an anonymous send; a 401/403 hints to `rs2 login`). Content-type is inferred from the file extension unless `--content-type` is given. Prints `created` (201) or `overwritten` (200) |
 | `rs2 service add <mount.json> [--path <p>]` | Add a mount to the running tenant via the self-config API. Reads `GET /services/raw` (with its ETag), appends the mount spec, and `PUT`s it back `If-Match`. The path is `--path` or the file's `path`; **fails if a mount already occupies that exact path** (nothing changes). Sends the saved token if valid but doesn't require it (so an open `/services` can be configured before any admin exists) |
 | `rs2 service set-access <path> --access <json> [--set k=v]…` | Set the `access` policy on an **existing** mount in place (the GET→merge→`PUT If-Match` dance, like `service add` but editing not adding). `--access` is the policy JSON (e.g. `'{"read":"A","write":"A"}'`); each `--set key=value` adds a `config` key (value parsed as JSON, so `enforceSchema=true` works). Used to tighten an open bootstrap mount |
@@ -21,6 +21,7 @@ The `rs2` CLI covers both the **developer loop** (scaffold, run, validate, deplo
 | `rs2 auth create-admin --email <e> [--password <p>] [--roles A] [--data-mount /data] [--user-dataset users]` | Seed the first operator: hash the password locally (argon2id) and write `{passwordHash, roles, kind:"user"}` straight to the user dataset. **Seed-if-absent** (skips a visible existing record). Must run while the data mount is write-open and **before** any field-authz schema is installed |
 | `rs2 pull [--host <url>] [--dir <d>]` | Mirror the tenant's **instruction plane** (config + every spec store + code pins) into a local directory (default `./rs2`, or the nearest existing `rs2/` walking up) for git-based editing. Discovers what to pull from `/.well-known/rs2/services` — config from the `control` block, every mount with a `specSubtree`. Records baseline ETags in `rs2/mirror.json`. Remote is source of truth (overwrites local specs — commit first) |
 | `rs2 push [--dir <d>] [--dry-run] [--allow-secret-rotation]` | Push local instruction-plane edits back: config via `PUT /services/raw` (server `If-Match`), specs via store writes (`If-Match` baseline; `If-None-Match: *` for creates). Aborts on a remote change (config 409 / spec 412) with *run `rs2 pull` to reconcile* rather than clobbering. `--dry-run` prints the diff + planned requests. Refuses to push a real secret value where the `"<secret>"` marker belongs unless `--allow-secret-rotation`. Code bundles are **not** pushed — deploy with `rs2 deploy` and repoint the mount in `tenant.json` |
+| `rs2 sync --from <name\|url> --to <name\|url> [--mount <path>]… [--no-data\|--data-only] [--prune] [--dry-run]` | Copy a tenant — or only the named mounts — **between two servers**, instruction plane and data plane: code bundles first (content-addressed, so a bundle already on the target is skipped), then the config through `PUT /services/raw` (validated + hot-swapped), then every `specSubtree` store, then the contents of every `store`-shaped mount (`file`, `data`, a custom `store` service — not a `wrapper`). Each side is a `servers` name from `rsconfig.json` or a base URL (token found by origin, else anonymous). **Source wins**; target-only mounts/specs/files/records are kept unless `--prune`. Whole-config mode keeps the target's own `services` control mount verbatim; `--mount /p` replaces just that entry (+ its specs, bundle, data) and leaves the rest of the target config alone. Secrets travel as `"<secret>"` markers and are restored from the **target's** stored values — a slot the target has never held aborts before any write, naming the pointer. `--dry-run` prints every planned `code`/`config`/`spec`/`data` operation. Idempotent: a second run reports nothing changed. See *Copying between servers* below |
 | `rs2 run <script>` | Run a script of `rs2` commands — one per line, with `rs2` omitted (e.g. `send /files/x --file ./x`). Blank lines and `#` comments are skipped; each line is echoed then run **in order, aborting on the first failure**. `dev` is rejected (it never returns) |
 
 ## Admin/ops config (`rsconfig.json`)
@@ -43,6 +44,17 @@ The admin commands (`login`, `send`, `service add`, `deploy`, `run`) read their 
 A typical flow: `rs2 login` once (writes the token), then `send` / `service add` / `deploy` / `run` reuse it until it expires.
 
 - `caFile` — optional PEM bundle of extra certificate authorities to trust when reaching `host` (see TLS below). A relative path resolves against the `rsconfig.json` that holds it.
+- `servers` — optional map of **named servers** beyond the default, each with the same `host`/`login`/`auth`/`caFile` shape. `rs2 login --server prod --host https://p.example` fills `servers.prod`; `rs2 sync --from staging --to prod` reads both. A token stored under any name is also found by origin, so `rs2 send`/`deploy` pointed at that host use it too.
+
+```json
+{
+  "host": "http://127.0.0.1:3100",
+  "servers": {
+    "staging": { "host": "https://staging.acme.com", "auth": { "token": "…", "exp": 1799999999, "host": "https://staging.acme.com" } },
+    "prod":    { "host": "https://api.acme.com" }
+  }
+}
+```
 
 **Gitignore `rsconfig.json`.** It holds a live bearer token, and often the password it was minted from — it is CLI state, not project config.
 
@@ -106,7 +118,22 @@ What's mirrored is **discovered, not hardcoded**: `pull` reads `/.well-known/rs2
 
 **Concurrency & safety.** Both planes use one model: config writes carry the server-enforced `If-Match`; spec writes carry `If-Match` against the recorded baseline (the `conditional-write` facet). A remote change since your pull aborts the push (config 409 / spec 412) with *run `rs2 pull` to reconcile* — it never clobbers. The new baseline ETag comes straight from the PUT response. Secrets stay write-only: `tenant.json` holds `"<secret>"` markers (the server restores real values on PUT), and push refuses a real value in a secret slot unless `--allow-secret-rotation`.
 
-**Boundary.** The mirror is the instruction plane only. Front-end assets and `data` records are the **data plane** — deploy those separately (`rs2 send`, store writes), not via `push`. Custom-code bundles aren't pushed either: `rs2 deploy` uploads them (content-addressed) and `tenant.json` pins `code:<name>@<version>`.
+**Boundary.** The mirror is the instruction plane only. Front-end assets and `data` records are the **data plane** — deploy those separately (`rs2 send`, store writes), not via `push`. Custom-code bundles aren't pushed either: `rs2 deploy` uploads them (content-addressed) and `tenant.json` pins `code:<name>@<version>`. To move **both planes plus bundles between two servers**, use `rs2 sync` (next section) rather than pull + push.
+
+## Copying between servers (`sync`)
+
+`rs2 sync --from A --to B` promotes a tenant from one node to another (laptop → staging, staging → prod) without a local mirror. It reads the discovery surface on both sides and applies, in an order that keeps the target valid after every step:
+
+1. **Code** — every `code:<name>@<version>` pinned by an in-scope mount: skipped if the target already holds that version, else fetched from the source and deployed (`POST <code>/<name>/`, with the deploy manifest when one exists). If the target names the bundle differently the pin is rewritten and a note printed.
+2. **Config** — `GET → plan → PUT If-Match` (re-planned on a 409). Whole-config mode: the source document wins every top-level key (`operatorRoles`, `cors`, …) except that the target's own `services` mount is kept verbatim and target-only mounts are appended (or dropped with `--prune`; their data is never deleted). `--mount /p` mode: only that entry is replaced or added.
+3. **Specs** — each `specSubtree` in scope, compared on canonical JSON; source-only or differing specs are written (no `If-Match`: source wins), target-only ones deleted with `--prune`.
+4. **Data** — each `store`-shaped mount in scope (`file`, `data`; a `wrapper` is skipped because it fronts another mount, and a subtree that belongs to a nested mount is left to that mount). Files are compared by size then bytes and written with their content type; datasets copy `.schema.json` before their records; records are compared as canonical JSON. `--prune` deletes target-only files/records and whole target-only datasets (`?confirm=`).
+
+`--no-data` stops after step 3; `--data-only` runs only step 4 (the mounts must already exist on the target with the same service). `--dry-run` prints every planned line (`code would deploy …`, `config would set mount …`, `data would create …`, `secret MISSING …`) and exits 0.
+
+**Secrets.** `GET /services/raw` redacts secrets to `"<secret>"`, and the target's `PUT` restores each marker from its *own* stored value — so the target must already hold a value for every secret slot the source config carries (`rs2 auth enable` on the target for `auth.jwtSecret`; a real value via `PUT /services/raw` for `/secrets/<name>`). Sync checks this up front and aborts before writing anything, listing the JSON pointers. Scoped `--mount` transfers don't carry the top-level `auth`/`secrets` blocks and so are unaffected.
+
+**Limits.** Bodies are transferred whole, in memory (same as `rs2 send`). `--ca-file` is one global bundle, so two servers behind different private CAs need a single PEM holding both. ETags are not compared across servers (they are adapter version strings); change detection is size/bytes for files and canonical JSON otherwise.
 
 ## Server config (`serverConfig.json`)
 
