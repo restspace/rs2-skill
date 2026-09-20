@@ -111,6 +111,41 @@ The executor partitions a serial pipeline into segments at materialization point
 
 Large/unknown-size streaming bodies are not snapshotted (default threshold 1 MB): such a segment runs at most once — streaming is preserved at the cost of that segment's retryability.
 
+## Triggered by a socket message (Cloudflare host only)
+
+A pipeline mount with `"webSocket": true` in its config (see `services.md`
+→ "WebSocket-enabled mounts") runs its pipeline **per inbound socket
+message**, not just per HTTP request: the frame arrives as the in-flight
+message body (JSON or text per the mount's `text` config), the pipeline's
+result is sent back as the reply frame, and a `204`/no body means no reply
+is sent. This is the same execution model as a webhook or scheduled
+trigger — an event lands as a request and the pipeline processes it — just
+with the socket connection as the event source instead of an inbound POST
+or a timer.
+
+By default only `message` events reach the pipeline. Opt a `pipeline` mount
+into `open`/`close` events too with `"webSocket": {"events": ["open",
+"message", "close"]}`; the three are distinguishable by the
+`x-rs2-socket-event` header on the synthetic request, testable in a step's
+`if` with the ordinary `header()` builtin:
+
+```json
+{ "if": "header(\"x-rs2-socket-event\") == 'open'",
+  "call": { "method": "PUT", "url": "/data/presence/${url.query.id}" } }
+```
+
+**Sending from a pipeline.** A pipeline anywhere in the tenant — not just the
+one attached to the socket — can push a frame to connected sockets with an
+ordinary `call` step against the target mount's `.sockets/` subtree:
+
+```json
+{ "call": { "method": "POST", "url": "/chat/.sockets/room/${roomId}/" } }
+```
+
+The call carries the in-flight body as the frame and needs `write` role on
+that mount (or `elevate`, same as any other internal call — see "elevate"
+above) since it's an ordinary internal dispatch, not a special socket op.
+
 ## Debugging a pipeline
 
 1. `GET <mount>/.pipelines/<spec>?$plan` — confirm the stored typed form is what you meant (especially after DSL input) and check the warnings.

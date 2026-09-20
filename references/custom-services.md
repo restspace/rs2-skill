@@ -65,6 +65,81 @@ export default async (msg, ctx) => {
 
 Cumulative streamed bytes (in or out) are bounded by the same materialization cap; exceeding it aborts the stream. The handler's wall-clock limit spans the whole stream (backpressure waits count against it). A streamed response is ephemeral — non-cacheable, no ETag. These flags are **JS-engine only**; the Wasm boundary still materializes.
 
+## Inbound WebSocket handlers (Cloudflare host only)
+
+A `code:` mount with `"webSocket": true` (see `services.md` → "WebSocket-
+enabled mounts") may export up to three handlers beside `default`, one per
+socket event:
+
+```js
+export async function onOpen(msg, ctx, socket) { /* … */ }
+export async function onMessage(msg, ctx, socket) { /* … */ }
+export async function onClose(msg, ctx, socket) { /* … */ }
+export default async (msg, ctx) => { /* plain HTTP requests to this mount */ };
+```
+
+- `msg` is the ordinary guest message: `body` is the frame (JSON-parsed or
+  string per the mount's `text` config, base64 for binary); for `onClose`,
+  `body` is `{code, reason, wasClean}`.
+- `socket` is `{id, send(data), close(code?, reason?)}` — **never the raw
+  WebSocket**. `send`/`close` reach the host over the same RPC path as
+  `ctx.request` (§ guest-async applies: `await` them on this host).
+  `send`/`close` can only address a socket id on **this handler's own
+  mount** — never another mount's.
+- The handler's **return value is the reply frame** — same envelope rules
+  as `default` (`{status?, headers?, body?, mediaType?}`; `204`/no body
+  sends nothing back). Missing `onOpen`/`onClose` is a silent no-op (204);
+  missing `onMessage` when the mount dispatches `message` events is a 502
+  `contract_violation`.
+- **Each event is its own invocation** — its own CPU budget, its own wall
+  clock, its own outbound-call budget. There is no long-running process per
+  connection: a handler that wants to remember something between messages
+  reaches for `ctx.state.get/put` (durable, keyed per mount) or a `data`
+  mount, not a module-level variable.
+
+**Limits and close codes.** Per-frame/per-connection ceilings come from the
+mount's `limits.webSocket` (see `services.md`); a breach closes the socket
+with an application code in the 4000s (RFC 6455's private-use range), built
+as `4000 + the RS2 error's HTTP status`, reason = the RS2 error code:
+
+| Breach | Close code / reason |
+| --- | --- |
+| Frame bigger than the configured `messageBytes` | `4413` `limit_exceeded:ws_message_bytes` |
+| Too many messages in flight on the socket | `4429` `limit_exceeded:ws_messages_in_flight` |
+| Message rate over the configured cap | `4429` `limit_exceeded:ws_messages_per_second` |
+| Auth token expired | `4401` `unauthorized` |
+
+An event whose dispatch fails with a retryable `limit_exceeded` (breaker
+open, wall clock) also closes the socket; any other handler error sends the
+problem JSON back as a text frame and the socket stays open.
+
+**Minimal example — echo plus broadcast to a room.** Clients connect at
+`/chat/room/<roomId>`. A message replies to the sender (the return value)
+and is also fanned out to everyone else in the room via a `prefix`-granted
+pipeline call — keeping the socket-management surface (`.sockets/`) behind
+the pipeline's own authorization rather than reaching it directly from the
+guest:
+
+```js
+// mount: { "path": "/chat", "service": "code:chat@v1",
+//          "config": { "webSocket": { "events": ["message"] },
+//            "grants": { "fanout": { "prefix": "/chat-fanout" } } } }
+export async function onMessage(msg, ctx, socket) {
+  const roomId = msg.url.split("/")[2];               // /room/<id> from the connect path
+  const text = typeof msg.body === "string" ? msg.body : JSON.stringify(msg.body);
+  await ctx.request("fanout", { method: "POST", url: `/${roomId}`, body: text });
+  return { body: `echo: ${text}` };                    // reply to the sender
+}
+```
+
+The `/chat-fanout` pipeline mount (reached only via the `prefix` grant above)
+does the actual broadcast — see `pipelines.md` → "Triggered by a socket
+message" for the `call`-step shape:
+
+```json
+{ "pipeline": [ "POST /chat/.sockets/room/${url.path[0]}/" ] }
+```
+
 ## The Wasm service contract
 
 `rs2 new <name>` scaffolds a Rust component against the published WIT world (`rs2:service@0.1.0`): exports `init(config)` and `handle(message, config) -> result<message, string>`; imports `host.request/log/state-get/state-put`. Build with `cargo build --target wasm32-wasip2 --release`; the scaffold compiles as-is. Bodies materialize at the component boundary in v1 (no streaming through the sandbox).

@@ -154,6 +154,86 @@ A `wrapper` mount carries **one** pipeline spec inline in its config (`config.pi
 
 Use `pipeline` when you need many authored specs per mount or per-path `access`; use `wrapper` for a single fixed pipeline that should look and behave like the mount it wraps.
 
+## WebSocket-enabled mounts (Cloudflare host only)
+
+Any mount — a `pipeline`, a `code:` service, `wrapper`, even `file` — can
+accept inbound WebSocket connections by adding to its config:
+
+```json
+{ "webSocket": true }
+```
+
+or the expanded form to override the defaults:
+
+```json
+{ "webSocket": { "text": "json", "events": ["open", "message", "close"] } }
+```
+
+- `text` — how a text frame is typed for the handler: `"json"` (default,
+  `application/json`) or `"text"` (`text/plain`). Binary frames are always
+  `application/octet-stream`.
+- `events` — which socket events dispatch. `code:` mounts default to all
+  three (`open`/`message`/`close`); every other mount defaults to
+  `["message"]` only. An invalid value is a 400 at `PUT /services/raw`.
+
+A flagged mount gains the **`websocket`** facet in
+`GET /.well-known/rs2/services` and the `OPTIONS` descriptor, and the
+discovery `limits` object gains a `webSocket` sub-object:
+`{messageBytes, messagesInFlight, messagesPerSecond, socketsPerTenant}` —
+per-frame and per-connection ceilings, operator-configurable the same way as
+the other `limits` fields. A mount with **no** `webSocket` flag ignores
+`Upgrade: websocket` entirely and serves the plain GET (RFC 9110) — adding
+WebSocket support to a mount is strictly additive.
+
+**How a connection turns into requests.** The `GET` that carries
+`Upgrade: websocket` runs through the mount's ordinary `read` access check
+like any other GET — a 101 is never sent before authorization. On a
+`pipeline` mount the handshake is held to the **mount's** `access.read`
+(a spec's inline `access` does not apply to it; no mount `access` = denied). Once
+accepted, every socket event (a message arriving, the socket opening or
+closing) becomes its own internal `POST` to the connect URL, carrying the
+principal captured at connect: a `pipeline` mount runs its pipeline per
+message (see `pipelines.md`), a `code:` mount routes to its
+`onOpen`/`onMessage`/`onClose` export (see `custom-services.md`). Each event
+is one ordinary invocation with its own wall clock and budget — a socket
+does not hold resources open for the life of the connection.
+
+**Auth for browser clients.** A WebSocket handshake can't set an
+`Authorization` header, so besides the `rs-auth` cookie, a browser may offer
+a `Sec-WebSocket-Protocol` entry `rs2.bearer.<jwt>` alongside a real
+protocol name (conventionally `rs2`); the host selects the first non-bearer
+protocol offered, or echoes the bearer entry back when it's the only one
+offered. WebSocket upgrades are exempt from CORS, so a cookie-authenticated
+upgrade is instead guarded like any other unsafe request: an `Origin` the
+tenant's CORS policy doesn't trust is refused 403 (cross-site WebSocket
+hijacking protection).
+
+**The `/.sockets/` subtree** — sending to and managing connected sockets
+from outside the connection (a pipeline `call` step, an admin action). It
+exists only on `webSocket`-flagged mounts and is reserved the same way
+`.pipelines/`/`.queries/` are; `<rest>` is the connect path relative to the
+mount:
+
+| Request | Effect |
+| --- | --- |
+| `POST /<mount>/.sockets/<rest>` | Send the request body as a frame to sockets connected at exactly that path → `200 {"sent": n}` |
+| `POST /<mount>/.sockets/<rest>/` | …and everything beneath it (trailing slash = container); `/<mount>/.sockets/` addresses the whole mount |
+| `?$id=<socketId>` / `?$user=<principalId>` | Narrow the selection to one socket or one connected user |
+| `GET /<mount>/.sockets/<rest>/` | Listing (`application/vnd.rs2.dir+json`) of connected sockets under that path: `{path, entries: [{name: id, dir: false, path, user, connectedAt}], total}` + `X-Total-Count` |
+| `DELETE /<mount>/.sockets/<rest>[?code=&reason=]` | Close the selection (default code 1000) → `200 {"closed": n}` |
+
+Access: POST/DELETE need the mount's `write` role specifically (never
+`invoke`/`delete` — opening `invoke` to the public does not open the sockets), GET
+needs `read`; a `system`-sourced call (like a scheduler tick) bypasses
+access, and a pipeline's `call` step reaches it under the pipeline's own
+principal or an `elevate` role, same as any other internal call. Sending
+from a pipeline is documented in `pipelines.md`.
+
+**Cloudflare host only, for now.** Inbound WebSocket upgrade is served only
+on the Worker host — see `http-api.md` → "Hosts". On the Rust host a
+`webSocket`-flagged mount currently just serves the plain GET; bringing it
+to parity is a follow-up.
+
 ## proxy — forward to an external API with host-injected auth (`api`)
 
 Forward every request on the mount to a fixed external `target`, attaching credentials **host-side** so the secret never lives in tenant config or reaches any guest. This is the no-code "proxy adapter": mount it, point it at an upstream, name a credential.

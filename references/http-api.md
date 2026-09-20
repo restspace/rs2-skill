@@ -22,6 +22,7 @@ The differences are declared, not discovered:
 | **`DELETE` of a directory that never existed → 204** | R2 has no directories; the Rust local-fs store answers 404. Accept `204|404` |
 | **`builtin:mem` is durable** | it is DO-SQLite-backed there, not ephemeral — don't rely on it being wiped |
 | **Guest (`code:`) store adapters don't pool connections across requests** | see `custom-services.md` → "Loadable adapters" |
+| **Inbound WebSocket upgrade is served only here** | a `webSocket`-flagged mount gains the **`websocket`** facet and the discovery `limits.webSocket` object; on the Rust host such a mount serves the plain GET unchanged (parity is a follow-up) — see `services.md` → "WebSocket-enabled mounts" |
 
 Everything else — including `If-Match` mismatch on `PUT /services/raw` being 409 not 412, and conditional headers being ignored on data `PATCH`/keyless `POST` — is reproduced exactly on both hosts.
 
