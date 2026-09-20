@@ -84,8 +84,20 @@ export default async (msg, ctx) => { /* plain HTTP requests to this mount */ };
 - `socket` is `{id, send(data), close(code?, reason?)}` — **never the raw
   WebSocket**. `send`/`close` reach the host over the same RPC path as
   `ctx.request` (§ guest-async applies: `await` them on this host).
-  `send`/`close` can only address a socket id on **this handler's own
-  mount** — never another mount's.
+  The handle addresses only the socket that raised the event.
+- `ctx.sockets` is the mount's **own** sockets, available in **every**
+  invocation of a `webSocket` mount — a socket handler, a plain HTTP request
+  to `default`, or a scheduled tick: `send(sel, data)` → `{sent}`,
+  `close(sel, code?, reason?)` → `{closed}`, `list(sel)` → the `/.sockets/`
+  listing. `sel` is `{path?, subtree?, id?, user?}` — `path` relative to the
+  mount as it appears in the URL (`"/room/42"` exact; `subtree: true` or a
+  trailing slash for everything beneath; `{}` = every socket on the mount).
+  This is the service acting on its own mount, so it is **not** checked
+  against the caller's roles (unlike `ctx.request`, which runs as the
+  caller) — and it can never reach another mount's sockets. `data` may be a
+  string, bytes (binary frame), or any JSON value. Each call debits the
+  outbound budget. On a mount without `"webSocket": true` it is
+  `capability_denied`.
 - The handler's **return value is the reply frame** — same envelope rules
   as `default` (`{status?, headers?, body?, mediaType?}`; `204`/no body
   sends nothing back). Missing `onOpen`/`onClose` is a silent no-op (204);
@@ -115,29 +127,37 @@ problem JSON back as a text frame and the socket stays open.
 
 **Minimal example — echo plus broadcast to a room.** Clients connect at
 `/chat/room/<roomId>`. A message replies to the sender (the return value)
-and is also fanned out to everyone else in the room via a `prefix`-granted
-pipeline call — keeping the socket-management surface (`.sockets/`) behind
-the pipeline's own authorization rather than reaching it directly from the
-guest:
+and fans out to the whole room through `ctx.sockets`:
 
 ```js
 // mount: { "path": "/chat", "service": "code:chat@v1",
 //          "config": { "webSocket": { "events": ["message"] },
-//            "grants": { "fanout": { "prefix": "/chat-fanout" } } } }
+//                      "access": { "read": "authenticated", "write": "A" } } }
 export async function onMessage(msg, ctx, socket) {
-  const roomId = msg.url.split("/")[2];               // /room/<id> from the connect path
-  const text = typeof msg.body === "string" ? msg.body : JSON.stringify(msg.body);
-  await ctx.request("fanout", { method: "POST", url: `/${roomId}`, body: text });
-  return { body: `echo: ${text}` };                    // reply to the sender
+  // msg.url is the full path; ctx.sockets paths are relative to the mount.
+  const rel = msg.url.split("?")[0].slice(msg.headers["x-rs2-base-path"].length);   // "/room/<id>"
+  const room = rel.split("/").slice(0, 3).join("/");
+  await ctx.sockets.send({ path: room }, { from: socket.id, text: msg.body });
+  return { body: { ok: true } };                       // reply to the sender only
 }
 ```
 
-The `/chat-fanout` pipeline mount (reached only via the `prefix` grant above)
-does the actual broadcast — see `pipelines.md` → "Triggered by a socket
-message" for the `call`-step shape:
+**Scheduled push.** A tick (`config.schedule`) invokes `default` with
+`x-rs2-trigger: schedule`; it has no `socket`, so it pushes with
+`ctx.sockets`. (A `prefix` grant + `ctx.request` onto `/.sockets/` does
+**not** work for this: a guest's `ctx.request` runs as its caller — it does
+not inherit the tick's `system` source — so it is refused by the mount's
+`write` role.)
 
-```json
-{ "pipeline": [ "POST /chat/.sockets/room/${url.path[0]}/" ] }
+```js
+// config: { "webSocket": true, "schedule": { "every": "30s" }, … }
+export default async (msg, ctx) => {
+  if (msg.headers["x-rs2-trigger"] === "schedule") {
+    const { sent } = await ctx.sockets.send({}, { tick: Date.now() });   // every socket on this mount
+    return { body: { sent } };
+  }
+  return { status: 404 };
+};
 ```
 
 ## The Wasm service contract

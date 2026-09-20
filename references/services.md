@@ -224,9 +224,13 @@ mount:
 
 Access: POST/DELETE need the mount's `write` role specifically (never
 `invoke`/`delete` — opening `invoke` to the public does not open the sockets), GET
-needs `read`; a `system`-sourced call (like a scheduler tick) bypasses
-access, and a pipeline's `call` step reaches it under the pipeline's own
-principal or an `elevate` role, same as any other internal call. Sending
+needs `read`. A pipeline's `call` step reaches it under the caller's
+principal or the pipeline mount's `elevate` role, same as any other internal
+call; a scheduled **pipeline** mount's tick is `system`-sourced and passes.
+That does **not** extend to `code:` mounts: a guest's `ctx.request` always
+runs as its caller and never inherits a tick's `system` source, so a guest
+pushes to its own mount's sockets with `ctx.sockets` instead (own-mount only,
+not role-checked — see `custom-services.md`), not through a `prefix` grant. Sending
 from a pipeline is documented in `pipelines.md`.
 
 **Cloudflare host only, for now.** Inbound WebSocket upgrade is served only
